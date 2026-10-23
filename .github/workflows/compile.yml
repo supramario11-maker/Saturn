@@ -403,6 +403,8 @@ jobs:
     - name: Build iOS dependencies (SDL2, jsoncpp, curl)
       run: |
         set -e
+        git config --global http.version HTTP/1.1
+        git config --global http.postBuffer 524288000
         PREFIX="$PWD/build/ios-deps"
         mkdir -p "$PREFIX" build/ios-src && cd build/ios-src
         COMMON="-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64
@@ -410,7 +412,12 @@ jobs:
                 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_BUILD_TYPE=Release"
         build() { # name repo tag extra-cmake-args...
           n=$1; r=$2; t=$3; shift 3
-          git clone --depth 1 --branch "$t" "$r" "$n"
+          for i in 1 2 3 4 5; do
+            rm -rf "$n"
+            git clone --depth 1 --branch "$t" "$r" "$n" && break
+            echo "clone failed (attempt $i), retrying in 15s"; sleep 15
+          done
+          test -d "$n/.git"
           cmake -S "$n" -B "$n/_b" $COMMON "$@"
           cmake --build "$n/_b" -j"$(sysctl -n hw.ncpu)"
           cmake --install "$n/_b"
