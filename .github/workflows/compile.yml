@@ -1,56 +1,104 @@
-name: Compile
-
+name: Xcode Project + IPA
+ 
 on:
   push:
     branches: [ "legacy" ]
-
+    paths-ignore: [ "Saturn.xcodeproj/**" ]
+  workflow_dispatch:
+ 
+permissions:
+  contents: write   # needed to commit the generated project back
+ 
 jobs:
-  windows:
-    name: Windows (MSYS2)
-
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
-
+  macos:
+    name: macOS (generate, commit, build IPA)
+    runs-on: macos-latest
+ 
     steps:
-    - uses: actions/checkout@v3
-    - uses: msys2/setup-msys2@v2
+    - uses: actions/checkout@v4
+ 
     - name: Fetch Dependencies
-      run: pacman -S --noconfirm unzip make git mingw-w64-x86_64-gcc mingw-w64-x86_64-glew mingw-w64-x86_64-SDL2 mingw-w64-x86_64-SDL python3 mingw-w64-x86_64-curl mingw-w64-x86_64-jsoncpp
-    - name: Build
+      run: brew install cmake sdl2 glew jsoncpp curl pkg-config
+ 
+    # ---- 1. Generate the project from every file in the repo ----
+    - name: Generate Saturn.xcodeproj
       run: |
-        make
-        cd build/us_pc
-        rm -rf textures text src sound lib levels include data bin assets actors res
-        rm -f level_rules.mk
-        cd ../../
-    - name: Upload Binaries
+        python3 scripts/gen_xcodeproj.py --name Saturn \
+          --bundle-id com.saturn.app \
+          --exclude '.github/*' \
+          --define TARGET_MACOS
+        wc -l Saturn.xcodeproj/project.pbxproj
+        plutil -lint Saturn.xcodeproj/project.pbxproj
+        xcodebuild -list -project Saturn.xcodeproj
+ 
+    # ---- 2. Commit it back to the branch ----
+    - name: Commit Saturn.xcodeproj
+      run: |
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -f Saturn.xcodeproj
+        if git diff --cached --quiet; then
+          echo "xcodeproj unchanged, nothing to commit"
+        else
+          git commit -m "Update Saturn.xcodeproj [skip ci]"
+          git push
+        fi
+ 
+    # ---- 3. Build iOS (arm64) static libs the app links against ----
+    - name: Build iOS dependencies (SDL2, jsoncpp, curl)
+      run: |
+        set -e
+        PREFIX="$PWD/build/ios-deps"
+        mkdir -p "$PREFIX" build/ios-src && cd build/ios-src
+        COMMON="-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_INSTALL_PREFIX=$PREFIX
+                -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_BUILD_TYPE=Release"
+        build() { # name repo tag extra-cmake-args...
+          n=$1; r=$2; t=$3; shift 3
+          git clone --depth 1 --branch "$t" "$r" "$n"
+          cmake -S "$n" -B "$n/_b" $COMMON "$@"
+          cmake --build "$n/_b" -j"$(sysctl -n hw.ncpu)"
+          cmake --install "$n/_b"
+        }
+        build SDL https://github.com/libsdl-org/SDL release-2.30.8 \
+          -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF
+        build jsoncpp https://github.com/open-source-parsers/jsoncpp 1.9.5 \
+          -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_OBJECT_LIBS=OFF -DJSONCPP_WITH_TESTS=OFF
+        build curl https://github.com/curl/curl curl-8_10_1 \
+          -DBUILD_SHARED_LIBS=OFF -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DHTTP_ONLY=ON \
+          -DCURL_ENABLE_SSL=OFF -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF
+        ls "$PREFIX/lib"
+ 
+    # ---- 4. Build the iOS app (unsigned) and package Saturn.ipa ----
+    - name: Build iOS app
+      run: |
+        set -o pipefail
+        xcodebuild -project Saturn.xcodeproj -target Saturn-iOS \
+          -configuration Release -sdk iphoneos \
+          CONFIGURATION_BUILD_DIR="$PWD/build/ios-out" \
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+          build
+ 
+    - name: Package Saturn.ipa
+      run: |
+        rm -rf Payload Saturn.ipa
+        mkdir Payload
+        cp -R build/ios-out/Saturn.app Payload/
+        # embed the generated Xcode project inside the .app bundle
+        cp -R Saturn.xcodeproj Payload/Saturn.app/Saturn.xcodeproj
+        zip -qry Saturn.ipa Payload
+        unzip -l Saturn.ipa | grep "Saturn.xcodeproj/project.pbxproj"
+        ls -lh Saturn.ipa
+ 
+    - name: Upload IPA
       uses: actions/upload-artifact@v4
       with:
-        name: saturn-${{ github.run_number }}-${{ github.job }}
-        path: D:\a\Saturn\Saturn\build\us_pc\
-
-  linux:
-    name: Linux
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Fetch Dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y build-essential git python3 libglew-dev libsdl2-dev curl libcurl4-gnutls-dev libjsoncpp-dev
-    - name: Build
-      run: |
-        make
-        cd build/us_pc
-        rm -rf textures text src sound lib levels include data bin assets actors res
-        rm -f level_rules.mk
-        cd ../../
-    - name: Upload Binaries
+        name: Saturn-ipa-${{ github.run_number }}
+        path: Saturn.ipa
+ 
+    - name: Upload Xcode project
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: saturn-${{ github.run_number }}-${{ github.job }}
-        path: /home/runner/work/Saturn/Saturn/build/us_pc
+        name: saturn-xcodeproj-${{ github.run_number }}
+        path: Saturn.xcodeproj
