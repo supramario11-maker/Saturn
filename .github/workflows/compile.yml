@@ -1,4 +1,4 @@
- name: Xcode Project + IPA
+name: Xcode Project + IPA
  
 on:
   push:
