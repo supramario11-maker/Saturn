@@ -1,52 +1,54 @@
 name: Xcode Project + IPA
- 
+
 on:
   push:
     branches: [ "legacy" ]
     paths-ignore: [ "Saturn.xcodeproj/**" ]
   workflow_dispatch:
- 
+
 permissions:
   contents: write   # needed to commit the generated project back
- 
+
 jobs:
   macos:
-    name: macOS (generate, commit, build IPA)
+    name: macOS (Xcode, generate, commit, build IPA)
     runs-on: macos-latest
- 
+
     steps:
     - uses: actions/checkout@v4
- 
+
+    # ---- 0. Pick the newest Xcode installed on the runner ----
+    # (Apple does not allow downloading Xcode in CI; GitHub's Mac images already
+    #  ship several Xcode versions and this step selects one.)
+    - name: Select Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    - name: Show Xcode and SDKs
+      run: |
+        xcodebuild -version
+        xcodebuild -showsdks
+        xcrun --sdk iphoneos --show-sdk-path
+
     - name: Fetch Dependencies
       run: brew install cmake sdl2 glew jsoncpp curl pkg-config
- 
-    # ---- 1. Generate the project from every file in the repo ----
+
+    # ---- 1. Write helper scripts, then generate the project from every file ----
     - name: Write helper scripts
       run: |
         mkdir -p scripts build
         cat > scripts/analyze_sources.py << 'PYEOF'
         #!/usr/bin/env python3
-        """
-        Scan every source/header file in the repo and decide which C/C++/ObjC files must
-        NOT be compiled as standalone translation units in the Xcode project.
- 
-        Rules (a file matching any rule is listed in the project but not compiled):
-          1. *.inc.c / *.inc.cpp ...        -> include fragments (SM64 behaviors, geo, model data)
-          2. any source file that another file #includes (e.g. #include "wind.inc.c")
-          3. host-tool / doc / script directories (tools/, docs/, ...)
-          4. platform-specific file names (dxgi, direct3d, glx, x11, wayland, win32 ...)
-          5. unguarded platform-only includes (<windows.h>, <d3d11.h>, <X11/Xlib.h> ... outside #if)
- 
-        Writes:  --out     exclude list  ("path<TAB>reason" per line, read by gen_xcodeproj.py)
-                 --report  human-readable report (also includes warnings / things needing a port)
-        """
+        """Decide which C/C++/ObjC files must NOT be compiled standalone in the Xcode project."""
         import argparse, fnmatch, os, posixpath, re, sys
         from collections import defaultdict
- 
+
         COMPILE = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
         HEADERS = {".h", ".hpp", ".hh", ".hxx", ".inc"}
         PRUNE = {".git", "build", "DerivedData", "node_modules", ".svn"}
-        DIR_EXCLUDES = ["tools/*", "docs/*", "doc/*", ".github/*", "scripts/*", "tests/*", "test/*"]
+        DIR_EXCLUDES = ["tools/*", "docs/*", "doc/*", ".github/*", "scripts/*", "tests/*", "test/*",
+                        "bin/*", "dynos/*"]
         NAME_PATTERNS = ["*dxgi*", "*direct3d*", "*d3d11*", "*d3d12*", "*_glx*", "*wayland*",
                          "*x11*", "*win32*", "*_wgl*"]
         PLATFORM_INC = re.compile(
@@ -54,12 +56,11 @@ jobs:
             r"shlobj|psapi|tlhelp32|synchapi|wrl.*|x11/.*|gl/glx|wayland-.*|alsa/.*|pulse/.*|linux/.*|"
             r"sys/inotify|sys/epoll)(\.h)?$", re.I)
         GLEW_INC = re.compile(r"^GL/(glew|gl|glext)\.h$|^GL/glu\.h$")
- 
         INC_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
         IF_RE = re.compile(r"^\s*#\s*if(n?def)?\b")
         END_RE = re.compile(r"^\s*#\s*endif\b")
         MAIN_RE = re.compile(r"^\s*(int|void)\s+main\s*\(")
- 
+
         def scan(path):
             includes, unguarded, mains = [], [], 0
             depth, in_c = 0, False
@@ -81,17 +82,17 @@ jobs:
                         if depth == 0: unguarded.append(includes[-1])
                     elif MAIN_RE.match(line): mains += 1
             return includes, unguarded, mains
- 
+
         def main():
             ap = argparse.ArgumentParser()
             ap.add_argument("--root", default=".")
             ap.add_argument("--out", default="build/exclude-sources.txt")
             ap.add_argument("--report", default="build/source-analysis.txt")
-            ap.add_argument("--extra-exclude", action="append", default=[], help="extra glob to not compile")
-            ap.add_argument("--keep", action="append", default=[], help="glob that must always be compiled")
+            ap.add_argument("--extra-exclude", action="append", default=[])
+            ap.add_argument("--keep", action="append", default=[])
             a = ap.parse_args()
             root = os.path.abspath(a.root)
- 
+
             files = []
             for dp, dn, fn in os.walk(root):
                 dn[:] = sorted(d for d in dn if d not in PRUNE and not d.endswith(".xcodeproj"))
@@ -100,10 +101,10 @@ jobs:
             fset = set(files)
             by_base = defaultdict(list)
             for p in files: by_base[posixpath.basename(p)].append(p)
- 
+
             reasons = {}
             def mark(p, why): reasons.setdefault(p, why)
- 
+
             included_by = defaultdict(set)
             plat_hits, glew_hits, mains = {}, [], {}
             scanned = 0
@@ -129,17 +130,14 @@ jobs:
                 if ext in COMPILE:
                     bad = [i for i in unguarded if PLATFORM_INC.match(i)]
                     if bad: plat_hits[rel] = bad
-                    g = [i for i in unguarded if GLEW_INC.match(i)]
-                    if g: glew_hits.append(rel)
- 
+                    if [i for i in unguarded if GLEW_INC.match(i)]: glew_hits.append(rel)
+
             for rel in files:
                 ext = os.path.splitext(rel)[1].lower()
                 if ext not in COMPILE: continue
                 base = posixpath.basename(rel)
                 if re.search(r"\.inc\.[^.]+$", base): mark(rel, "include fragment (*.inc.c)")
-                if rel in included_by:
-                    inc_by = sorted(included_by[rel])[0]
-                    mark(rel, f"#included by {inc_by}")
+                if rel in included_by: mark(rel, f"#included by {sorted(included_by[rel])[0]}")
                 for g in DIR_EXCLUDES + a.extra_exclude:
                     if fnmatch.fnmatch(rel, g): mark(rel, f"excluded directory/glob {g}"); break
                 if any(fnmatch.fnmatch(base.lower(), g) for g in NAME_PATTERNS):
@@ -147,54 +145,40 @@ jobs:
                 if rel in plat_hits: mark(rel, "unguarded platform include <" + plat_hits[rel][0] + ">")
             for rel in list(reasons):
                 if any(fnmatch.fnmatch(rel, g) for g in a.keep): del reasons[rel]
- 
+
             compiled = [p for p in files if os.path.splitext(p)[1].lower() in COMPILE and p not in reasons]
             dup = defaultdict(list)
             for p in compiled: dup[posixpath.basename(p)].append(p)
             dup = {k: v for k, v in dup.items() if len(v) > 1}
- 
+
             os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
             with open(a.out, "w") as f:
                 for p in sorted(reasons): f.write(f"{p}\t{reasons[p]}\n")
- 
-            cats = defaultdict(int)
-            for w in reasons.values(): cats[w.split(" ")[0] + " " + (w.split(" ")[1] if " " in w else "")] += 1
+
             lines = [f"Scanned {scanned} source/header files out of {len(files)} total files",
                      f"Compile-type files: {len(compiled) + len(reasons)}  ->  compiled: {len(compiled)}, "
-                     f"listed only: {len(reasons)}", "", "Excluded by reason:"]
-            lines += [f"  {n:6d}  {c.strip()}" for c, n in sorted(cats.items(), key=lambda x: -x[1])]
-            lines += ["", "== Excluded files =="] + [f"  {p}   [{reasons[p]}]" for p in sorted(reasons)]
+                     f"listed only: {len(reasons)}", "", "== Excluded files =="]
+            lines += [f"  {p}   [{reasons[p]}]" for p in sorted(reasons)]
             if glew_hits:
-                lines += ["", "== WARNING: desktop OpenGL/GLEW headers (<GL/...>) used unguarded =="
-                          "  (not available on iOS - needs a GLES port or shim header)"]
+                lines += ["", "== WARNING: desktop OpenGL/GLEW headers used unguarded (not on iOS) =="]
                 lines += [f"  {p}" for p in sorted(glew_hits)]
             if len(mains) > 1:
-                lines += ["", "== WARNING: several files define main() - link will fail =="]
-                lines += [f"  {p}" for p in sorted(mains)]
+                lines += ["", "== WARNING: several files define main() =="] + [f"  {p}" for p in sorted(mains)]
             if dup:
-                lines += ["", "== NOTE: compiled files sharing a base name (possible object collisions) =="]
+                lines += ["", "== NOTE: compiled files sharing a base name =="]
                 lines += [f"  {k}: {', '.join(v)}" for k, v in sorted(dup.items())]
             with open(a.report, "w") as f: f.write("\n".join(lines) + "\n")
-            print("\n".join(lines[:12]))
+            print("\n".join(lines[:4]))
             print(f"-> {a.out} ({len(reasons)} entries), {a.report}")
- 
+
         if __name__ == "__main__":
             sys.exit(main())
         PYEOF
         cat > scripts/gen_xcodeproj.py << 'PYEOF'
         #!/usr/bin/env python3
-        """
-        Scan every file in a repo and generate <name>.xcodeproj/project.pbxproj.
- 
-         - Every file appears in the Xcode navigator (folder tree mirrors the repo).
-         - C/C++/ObjC sources go in the "Compile Sources" phase of a native target.
-         - A second "make" target (PBXLegacyTarget) runs the repo's Makefile, which is
-           the reliable way to actually build projects that need generated assets.
- 
-        Usage: python3 scripts/gen_xcodeproj.py --name Saturn [--exclude 'glob' ...]
-        """
+        """Scan every file in a repo and generate <name>.xcodeproj/project.pbxproj (macOS tool, iOS app, make target)."""
         import argparse, fnmatch, hashlib, os, re, sys
- 
+
         SRC = {".c": "sourcecode.c.c", ".cc": "sourcecode.cpp.cpp", ".cpp": "sourcecode.cpp.cpp",
                ".cxx": "sourcecode.cpp.cpp", ".m": "sourcecode.c.objc", ".mm": "sourcecode.cpp.objcpp"}
         HDR = {".h": "sourcecode.c.h", ".hpp": "sourcecode.cpp.h", ".hh": "sourcecode.cpp.h",
@@ -204,13 +188,15 @@ jobs:
                  ".xml": "text.xml", ".yml": "text", ".yaml": "text", ".md": "net.daringfireball.markdown",
                  ".txt": "text", ".mk": "text", ".s": "sourcecode.asm", ".glsl": "text", ".lua": "text"}
         PRUNE_DIRS = {".git", "build", "DerivedData", "node_modules", ".svn"}
- 
+        # header folders that must NOT go on the search path (N64/Windows replacement headers, tools, assets)
+        HDR_SKIP_PREFIX = ("tools", "dynos", "bin", "include/libc", "include/dxsdk", "include/GL")
+
         def uid(s): return hashlib.md5(s.encode()).hexdigest()[:24].upper()
- 
+
         def q(s):
             if s and re.fullmatch(r"[A-Za-z0-9_./]+", s): return s
             return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
- 
+
         def fmt(v):
             if isinstance(v, bool): return "1" if v else "0"
             if isinstance(v, int): return str(v)
@@ -218,20 +204,19 @@ jobs:
             if isinstance(v, list): return "(" + " ".join(fmt(x) + "," for x in v) + ")"
             if isinstance(v, dict): return "{" + " ".join(f"{k} = {fmt(x)};" for k, x in v.items()) + "}"
             raise TypeError(v)
- 
+
         def main():
             ap = argparse.ArgumentParser()
             ap.add_argument("--root", default=".")
             ap.add_argument("--name", default="App")
-            ap.add_argument("--exclude", action="append", default=[], help="glob of paths to skip entirely")
-            ap.add_argument("--exclude-sources", action="append", default=[],
-                            help="glob of source files to list but NOT compile")
-            ap.add_argument("--exclude-from", help="file from analyze_sources.py: 'path<TAB>reason' lines, listed but not compiled")
-            ap.add_argument("--define", action="append", default=[], help="preprocessor define, e.g. TARGET_MACOS")
+            ap.add_argument("--exclude", action="append", default=[])
+            ap.add_argument("--exclude-sources", action="append", default=[])
+            ap.add_argument("--exclude-from")
+            ap.add_argument("--define", action="append", default=[])
             ap.add_argument("--jobs", default="8")
-            ap.add_argument("--bundle-id", default="com.example.saturn", help="iOS bundle identifier")
+            ap.add_argument("--bundle-id", default="com.example.saturn")
             a = ap.parse_args()
- 
+
             root = os.path.abspath(a.root)
             skip_compile = set()
             if a.exclude_from and os.path.exists(a.exclude_from):
@@ -247,8 +232,7 @@ jobs:
                     if any(fnmatch.fnmatch(rel, g) for g in a.exclude): continue
                     if os.path.islink(os.path.join(dp, f)) and not os.path.exists(os.path.join(dp, f)): continue
                     files.append(rel)
- 
-            # ---- group tree ----
+
             subdirs, dirfiles = {"": set()}, {"": []}
             for rel in files:
                 d = os.path.dirname(rel)
@@ -258,15 +242,15 @@ jobs:
                     subdirs.setdefault(parent, set()).add(cur)
                     subdirs.setdefault(cur, set()); dirfiles.setdefault(cur, [])
                 dirfiles.setdefault(d, []).append(rel)
- 
+
             S = {k: [] for k in ["PBXBuildFile", "PBXFileReference", "PBXGroup", "PBXLegacyTarget",
                                  "PBXNativeTarget", "PBXProject", "PBXSourcesBuildPhase",
                                  "XCBuildConfiguration", "XCConfigurationList"]}
             def add(sec, id_, **kw): S[sec].append(f"\t\t{id_} = {fmt(kw)};")
- 
+
             build_ids, ios_build_ids, header_dirs = [], [], set()
             def fid(rel): return uid("F:" + rel)
- 
+
             for rel in files:
                 ext = os.path.splitext(rel)[1].lower()
                 base = os.path.basename(rel)
@@ -274,22 +258,23 @@ jobs:
                 else: ftype = SRC.get(ext) or HDR.get(ext) or OTHER.get(ext) or "text"
                 add("PBXFileReference", fid(rel), isa="PBXFileReference", lastKnownFileType=ftype,
                     name=base, path=base, sourceTree="<group>")
-                if ext in HDR: header_dirs.add(os.path.dirname(rel))
+                if ext in HDR:
+                    d = os.path.dirname(rel)
+                    if d and " " not in d and not d.startswith(HDR_SKIP_PREFIX):
+                        header_dirs.add(d)
                 if ext in SRC and rel not in skip_compile and not any(fnmatch.fnmatch(rel, g) for g in a.exclude_sources):
                     bid = uid("B:" + rel)
-                    add("PBXBuildFile", bid, isa="PBXBuildFile", fileRef=fid(rel))
-                    build_ids.append(bid)
+                    add("PBXBuildFile", bid, isa="PBXBuildFile", fileRef=fid(rel)); build_ids.append(bid)
                     ibid = uid("BI:" + rel)
-                    add("PBXBuildFile", ibid, isa="PBXBuildFile", fileRef=fid(rel))
-                    ios_build_ids.append(ibid)
- 
+                    add("PBXBuildFile", ibid, isa="PBXBuildFile", fileRef=fid(rel)); ios_build_ids.append(ibid)
+
             prod_ref, prod_grp, ios_ref = uid("PRODREF"), uid("PRODGRP"), uid("PRODREF_IOS")
             add("PBXFileReference", ios_ref, isa="PBXFileReference", explicitFileType="wrapper.application",
                 includeInIndex=0, path=f"{a.name}.app", sourceTree="BUILT_PRODUCTS_DIR")
             add("PBXFileReference", prod_ref, isa="PBXFileReference", explicitFileType="compiled.mach-o.executable",
                 includeInIndex=0, path=a.name, sourceTree="BUILT_PRODUCTS_DIR")
             add("PBXGroup", prod_grp, isa="PBXGroup", children=[prod_ref, ios_ref], name="Products", sourceTree="<group>")
- 
+
             def gid(d): return uid("G:" + d)
             for d in subdirs:
                 kids = [gid(s) for s in sorted(subdirs[d])] + [fid(f) for f in sorted(dirfiles.get(d, []))]
@@ -298,19 +283,18 @@ jobs:
                 else:
                     b = os.path.basename(d)
                     add("PBXGroup", gid(d), isa="PBXGroup", children=kids, name=b, path=b, sourceTree="<group>")
- 
-            # ---- settings ----
-            inc = ["$(SRCROOT)", "/opt/homebrew/include", "/usr/local/include"] + \
-                  ["$(SRCROOT)/" + d for d in sorted(header_dirs) if d]
+
+            dirs_paths = ["$(SRCROOT)/" + d for d in sorted(header_dirs)]
             common = {"ALWAYS_SEARCH_USER_PATHS": "NO", "SDKROOT": "macosx", "MACOSX_DEPLOYMENT_TARGET": "11.0",
                       "CLANG_CXX_LANGUAGE_STANDARD": "gnu++17", "CLANG_CXX_LIBRARY": "libc++",
                       "GCC_C_LANGUAGE_STANDARD": "gnu11", "GCC_WARN_INHIBIT_ALL_WARNINGS": "YES",
                       "CODE_SIGNING_ALLOWED": "NO", "ENABLE_USER_SCRIPT_SANDBOXING": "NO"}
-            native = {**common, "PRODUCT_NAME": a.name, "HEADER_SEARCH_PATHS": inc,
+            native = {**common, "PRODUCT_NAME": a.name,
+                      "HEADER_SEARCH_PATHS": ["$(SRCROOT)", "/opt/homebrew/include", "/usr/local/include"] + dirs_paths,
                       "LIBRARY_SEARCH_PATHS": ["/opt/homebrew/lib", "/usr/local/lib"],
                       "OTHER_LDFLAGS": ["-lSDL2", "-lGLEW", "-lcurl", "-ljsoncpp", "-framework", "OpenGL"]}
             if a.define: native["GCC_PREPROCESSOR_DEFINITIONS"] = a.define + ["$(inherited)"]
- 
+
             ios_fw = ["UIKit", "OpenGLES", "Metal", "QuartzCore", "CoreGraphics", "Foundation", "AVFoundation",
                       "AudioToolbox", "CoreAudio", "CoreMotion", "CoreHaptics", "GameController",
                       "CoreBluetooth", "ImageIO", "MobileCoreServices"]
@@ -323,13 +307,11 @@ jobs:
                    "INFOPLIST_KEY_UILaunchScreen_Generation": "YES",
                    "INFOPLIST_KEY_UISupportedInterfaceOrientations": "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight",
                    "MARKETING_VERSION": "1.0", "CURRENT_PROJECT_VERSION": "1",
-                   "HEADER_SEARCH_PATHS": ["$(SRCROOT)/build/ios-deps/include",
-                                           "$(SRCROOT)/build/ios-deps/include/SDL2"] + inc[1:1] + inc[3:],
+                   "HEADER_SEARCH_PATHS": ["$(SRCROOT)", "$(SRCROOT)/build/ios-deps/include",
+                                           "$(SRCROOT)/build/ios-deps/include/SDL2"] + dirs_paths,
                    "LIBRARY_SEARCH_PATHS": ["$(SRCROOT)/build/ios-deps/lib"], "OTHER_LDFLAGS": ldflags}
-            ios["HEADER_SEARCH_PATHS"] = ["$(SRCROOT)", "$(SRCROOT)/build/ios-deps/include",
-                                          "$(SRCROOT)/build/ios-deps/include/SDL2"] + inc[3:]
             if a.define: ios["GCC_PREPROCESSOR_DEFINITIONS"] = a.define + ["TARGET_IOS", "$(inherited)"]
- 
+
             def configs(tag, settings):
                 ids = []
                 for n in ("Debug", "Release"):
@@ -339,12 +321,12 @@ jobs:
                 add("XCConfigurationList", l, isa="XCConfigurationList", buildConfigurations=ids,
                     defaultConfigurationIsVisible=0, defaultConfigurationName="Release")
                 return l
- 
+
             proj_cfg = configs("project", {"ALWAYS_SEARCH_USER_PATHS": "NO", "SDKROOT": "macosx"})
             nat_cfg = configs("native", native)
             ios_cfg = configs("ios", ios)
             leg_cfg = configs("legacy", {"PRODUCT_NAME": f"{a.name} (make)"})
- 
+
             phase, nat, leg = uid("PHASE"), uid("NATIVE"), uid("LEGACY")
             add("PBXSourcesBuildPhase", phase, isa="PBXSourcesBuildPhase", buildActionMask=2147483647,
                 files=build_ids, runOnlyForDeploymentPostprocessing=0)
@@ -366,42 +348,44 @@ jobs:
                 buildConfigurationList=proj_cfg, compatibilityVersion="Xcode 14.0", developmentRegion="en",
                 hasScannedForEncodings=0, knownRegions=["en", "Base"], mainGroup=gid(""),
                 productRefGroup=prod_grp, projectDirPath="", projectRoot="", targets=[nat, ios_t, leg])
- 
+
             out = ["// !$*UTF8*$!", "{", "\tarchiveVersion = 1;", "\tclasses = {", "\t};",
                    "\tobjectVersion = 56;", "\tobjects = {", ""]
             for sec, lines in S.items():
                 if not lines: continue
                 out += [f"/* Begin {sec} section */"] + sorted(lines) + [f"/* End {sec} section */", ""]
             out += ["\t};", f"\trootObject = {pid};", "}", ""]
- 
+
             os.makedirs(os.path.join(root, proj_dir), exist_ok=True)
             with open(os.path.join(root, proj_dir, "project.pbxproj"), "w") as f:
                 f.write("\n".join(out))
             print(f"{proj_dir}: {len(files)} files, {len(build_ids)} compiled, "
                   f"{len(header_dirs)} header dirs, {len(out)} pbxproj lines")
- 
+
         if __name__ == "__main__":
             sys.exit(main())
         PYEOF
- 
-    # ---- Check every .c/.cpp/.h/... file: which ones can be compiled standalone? ----
+
     - name: Analyze source files
       run: |
         python3 scripts/analyze_sources.py --out build/exclude-sources.txt --report build/source-analysis.txt
         echo "---- report (head) ----"; head -150 build/source-analysis.txt
- 
-    - name: Generate Saturn.xcodeproj
+
+    - name: Generate Saturn.xcodeproj (the pbxproj)
       run: |
         python3 scripts/gen_xcodeproj.py --name Saturn \
           --bundle-id com.saturn.app \
           --exclude-from build/exclude-sources.txt \
           --exclude '.github/*' \
-          --define TARGET_MACOS
+          --define TARGET_MACOS --define NON_MATCHING --define AVOID_UB \
+          --define VERSION_US --define NO_SEGMENTED_MEMORY
         wc -l Saturn.xcodeproj/project.pbxproj
         plutil -lint Saturn.xcodeproj/project.pbxproj
-        xcodebuild -list -project Saturn.xcodeproj
- 
-    # ---- 2. Commit it back to the branch ----
+
+    - name: Open project with Xcode (list targets)
+      run: xcodebuild -list -project Saturn.xcodeproj
+
+    # ---- 2. Commit the project back to the branch ----
     - name: Commit Saturn.xcodeproj
       run: |
         git config user.name  "github-actions[bot]"
@@ -411,10 +395,11 @@ jobs:
           echo "xcodeproj unchanged, nothing to commit"
         else
           git commit -m "Update Saturn.xcodeproj [skip ci]"
-          git push
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}"
         fi
- 
-    # ---- 3. Build iOS (arm64) static libs the app links against ----
+
+    # ---- 3. iOS arm64 static libraries the app links against ----
     - name: Build iOS dependencies (SDL2, jsoncpp, curl)
       run: |
         set -e
@@ -438,42 +423,43 @@ jobs:
           -DBUILD_SHARED_LIBS=OFF -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DHTTP_ONLY=ON \
           -DCURL_ENABLE_SSL=OFF -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF
         ls "$PREFIX/lib"
- 
-    # ---- 4. Build the iOS app (unsigned) and package Saturn.ipa ----
-    - name: Build iOS app
+
+    # ---- 4. Build the iOS app with Xcode (unsigned) ----
+    - name: Build iOS app with xcodebuild
       run: |
         set -o pipefail
         xcodebuild -project Saturn.xcodeproj -target Saturn-iOS \
           -configuration Release -sdk iphoneos \
           CONFIGURATION_BUILD_DIR="$PWD/build/ios-out" \
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-          build
- 
+          build 2>&1 | tee build/xcodebuild.log
+        grep -m 40 "error:" build/xcodebuild.log || true
+
+    # ---- 5. Package Saturn.ipa ----
     - name: Package Saturn.ipa
       run: |
         rm -rf Payload Saturn.ipa
         mkdir Payload
         cp -R build/ios-out/Saturn.app Payload/
-        # embed the generated Xcode project inside the .app bundle
-        cp -R Saturn.xcodeproj Payload/Saturn.app/Saturn.xcodeproj
         zip -qry Saturn.ipa Payload
-        unzip -l Saturn.ipa | grep "Saturn.xcodeproj/project.pbxproj"
         ls -lh Saturn.ipa
- 
+
     - name: Upload IPA
       uses: actions/upload-artifact@v4
       with:
         name: Saturn-ipa-${{ github.run_number }}
         path: Saturn.ipa
- 
-    - name: Upload source analysis
+
+    - name: Upload build logs and analysis
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: saturn-source-analysis-${{ github.run_number }}
-        path: build/source-analysis.txt
+        name: saturn-logs-${{ github.run_number }}
+        path: |
+          build/source-analysis.txt
+          build/xcodebuild.log
         if-no-files-found: ignore
- 
+
     - name: Upload Xcode project
       if: always()
       uses: actions/upload-artifact@v4
